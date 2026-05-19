@@ -1,153 +1,82 @@
-// Licensed under the MIT License
-export const hexToBytes = hex => Uint8Array.from(hex.match(/../g), b => parseInt(b, 16))
-export const bytesToUtf8 = bytes => new TextDecoder().decode(bytes)
+import { decodeScript, OP_LAST_PUSH, ScriptError, ScriptOp } from '@/utils/scriptParser.js'
+import { detectInscriptions } from '@/utils/scriptEnvelope.js'
+import { COVENANT_OPCODES, describePattern, detectScriptPattern } from '@/utils/scriptPatterns.js'
 
-// All covenant introspection opcodes, sourced from opcodes/mod.rs.
-// Used to fingerprint a redeem script as a covenant script.
-const COVENANT_OPCODES = new Set([
-    0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8,
-    0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
-    0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9,
-    0xcb, 0xcc, 0xcd, 0xce, 0xcf,
-    0xd0, 0xd1, 0xd2, 0xd3, 0xd4,
-])
+/**
+ * Master switch for higher-level pattern recognition. Flip to `false` to skip
+ * the structural pattern detector and fall back to plain opcode display.
+ * Inscription envelope detection and the covenant fingerprint are unaffected.
+ */
+export const PATTERN_DETECTION_ENABLED = true
 
-export class ScriptError extends Error {
-    static UnexpectedEof = new ScriptError('Unexpected end of script')
-}
+// Public re-exports — keep existing consumer imports stable.
+export { decodeScript, describePattern, ScriptError, ScriptOp }
 
-export class ScriptOp {
-    constructor(op, value = null) {
-        this.op = op
-        this.value = value
-    }
-    isPush() {
-        return this.op >= 0x00 && this.op <= 0x60
-    }
-    getPushData() {
-        if (this.op >= 0x01 && this.op <= 0x4e && this.value) return new Uint8Array(this.value)
-        return null
-    }
-}
-
+/**
+ * Decode a Kaspa signature script and enrich it with higher-level structure:
+ *
+ *   - Inscription envelopes (`op.innerOps` + `op.inscription`).
+ *   - P2SH redeem-script expansion on the last push-data item
+ *     (`op.innerOps`).
+ *   - `op.covenant = true` if any opcode in the redeem script is a
+ *     covenants_enabled-gated opcode.
+ *   - `op.pattern` with branch + template-tag info when
+ *     {@link PATTERN_DETECTION_ENABLED} is true and the redeem script matches
+ *     a known template (see scriptPatterns.js).
+ *
+ * Returns `{ ops }` on success or `null` if the top-level script can't be
+ * parsed at all.
+ */
 export function decodeScriptAndEnvelope(scriptHex) {
-    try {
-        const ops = decodeScript(scriptHex);
+  let ops
+  try {
+    ops = decodeScript(scriptHex)
+  } catch {
+    return null
+  }
 
-        for (const op of ops) {
-            const d = op.getPushData();
-            if (!d || d.length < 15) continue;
+  detectInscriptions(ops)
+  enrichRedeemScript(ops)
 
-            // Ensure it ends with OP_ENDIF
-            if (d[d.length - 1] !== 0x68) continue;
-
-            try {
-                const innerOps = decodeScript(d);
-                op.innerOps = innerOps;
-
-                // Find the Envelope start: OP_0 (0x00) then OP_IF (0x63)
-                const ifIdx = innerOps.findIndex((o, idx) => o.op === 0 && innerOps[idx + 1]?.op === 99);
-
-                if (ifIdx !== -1) {
-                    // The protocol is usually the first push after OP_IF
-                    const protoOp = innerOps[ifIdx + 2];
-
-                    // We look for the JSON blob.
-                    // Heuristic: It's a push and starts with '{' (0x7b)
-                    const jsonOp = innerOps.slice(ifIdx + 2).find(o => {
-                        const data = o.getPushData();
-                        return data && data[0] === 0x7b; // 0x7b is '{'
-                    });
-
-                    if (jsonOp) {
-                        const rawData = bytesToUtf8(jsonOp.getPushData());
-                        op.inscription = {
-                            protocol: protoOp?.isPush() ? bytesToUtf8(protoOp.getPushData()) : 'unknown',
-                            data: JSON.parse(rawData) // Convert plain JSON string to object
-                        };
-                    }
-                }
-            } catch (err) {
-                // If JSON.parse fails or script is malformed
-                console.warn('Envelope found but content was not valid JSON', err);
-            }
-        }
-
-        // P2SH redeem script detection: the last pushdata in a P2SH signatureScript is always
-        // the redeem script. Try to decode it; if it contains at least one non-push opcode
-        // (op > 0x60) it is a script worth expanding. Mark it as a covenant if it uses any
-        // covenant introspection opcodes.
-        const lastPushOp = [...ops].reverse().find(op => op.getPushData() !== null)
-        if (lastPushOp && !lastPushOp.innerOps) {
-            const d = lastPushOp.getPushData()
-            if (d && d.length >= 5) {
-                try {
-                    const innerOps = decodeScript(d)
-                    if (innerOps.some(o => o.op > 0x60)) {
-                        lastPushOp.innerOps = innerOps
-                        if (innerOps.some(o => COVENANT_OPCODES.has(o.op))) {
-                            lastPushOp.covenant = true
-                        }
-                    }
-                } catch {
-                    // not a valid script, ignore
-                }
-            }
-        }
-
-        return { ops };
-    } catch {
-        return null;
-    }
+  return { ops }
 }
 
-export function decodeScript(script) {
-    const bytes =
-        typeof script === 'string' ? hexToBytes(script) : script instanceof Uint8Array ? script : new Uint8Array(script)
-    const ops = []
-    let i = 0
-    while (i < bytes.length) {
-        const op = bytes[i++]
-        let value = null
-        try {
-            if (op >= 0x01 && op <= 0x4b) {
-                value = readBytes(bytes, i, op)
-                i += op
-            } else if (op === 0x4c) {
-                const len = readPushLength(bytes, i, 1)
-                i += 1
-                value = readBytes(bytes, i, len)
-                i += len
-            } else if (op === 0x4d) {
-                const len = readPushLength(bytes, i, 2)
-                i += 2
-                value = readBytes(bytes, i, len)
-                i += len
-            } else if (op === 0x4e) {
-                const len = readPushLength(bytes, i, 4)
-                i += 4
-                value = readBytes(bytes, i, len)
-                i += len
-            }
-        } catch (err) {
-            throw ScriptError.UnexpectedEof
-        }
-        ops.push(new ScriptOp(op, value))
-    }
-    return ops
+// The last pushdata in a P2SH signature script is the redeem script. Decode
+// it once, mark covenant usage, and (optionally) run pattern detection.
+//
+// P2SH spends always carry at least one signature push *before* the redeem
+// script, so a single-op top-level script (e.g. a bare Schnorr signature)
+// is treated as a plain push and left alone.
+function enrichRedeemScript(ops) {
+  if (ops.length < 2) return
+  const lastPushOp = findLastPushData(ops)
+  if (!lastPushOp || lastPushOp.innerOps) return
+
+  const data = lastPushOp.getPushData()
+  if (!data || data.length === 0) return
+
+  let innerOps
+  try {
+    innerOps = decodeScript(data)
+  } catch {
+    return
+  }
+
+  // Heuristic: at least one non-push opcode → worth treating as a script.
+  if (!innerOps.some((o) => o.op > OP_LAST_PUSH)) return
+
+  lastPushOp.innerOps = innerOps
+  if (innerOps.some((o) => COVENANT_OPCODES.has(o.op))) lastPushOp.covenant = true
+
+  if (PATTERN_DETECTION_ENABLED) {
+    const pattern = detectScriptPattern(innerOps)
+    if (pattern) lastPushOp.pattern = pattern
+  }
 }
 
-function readBytes(bytes, i, n) {
-    if (i + n > bytes.length) throw ScriptError.UnexpectedEof
-    return bytes.slice(i, i + n)
-}
-
-function readPushLength(bytes, i, sizeBytes) {
-    if (i + sizeBytes > bytes.length) throw ScriptError.UnexpectedEof
-    let len = 0
-    if (sizeBytes === 1) len = bytes[i]
-    else if (sizeBytes === 2) len = bytes[i] | (bytes[i + 1] << 8)
-    else if (sizeBytes === 4) len = bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24)
-    else throw ScriptError.UnexpectedEof
-    return len
+function findLastPushData(ops) {
+  for (let i = ops.length - 1; i >= 0; i--) {
+    if (ops[i].getPushData() !== null) return ops[i]
+  }
+  return null
 }
