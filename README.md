@@ -8,7 +8,7 @@ You can register [issues](https://github.com/kaspa-stream/explorer/issues) to pr
 
 ## Translations
 
-If you're missing a translation, submit a PR and I'll review and get it added :) 
+If you're missing a translation, submit a suggestion to add it [here](https://github.com/kaspa-stream/explorer/issues), get some upvotes and I'll get it added :) 
 
 ## Contact / general discussion
 
